@@ -1,6 +1,7 @@
 import { motion } from 'motion/react';
 import clsx from 'clsx';
 import { useEffect, useState } from 'react';
+import Image from 'next/image';
 
 type OrbState = 'idle' | 'listening' | 'thinking' | 'speaking';
 
@@ -86,10 +87,12 @@ export function Orb({ orbState, inputVolume, outputVolume }: OrbProps) {
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_30%,rgba(255,255,255,0.1)_0%,transparent_50%)] rounded-full mix-blend-overlay" />
         
         {/* Actual Image if uploaded */}
-        <img 
+        <Image 
            src="/orb.png" 
            alt="BLACKTOWER NEXUS Orb" 
-           className="absolute inset-0 w-full h-full object-cover rounded-full mix-blend-lighten"
+           fill
+           sizes="256px"
+           className="object-contain p-2 mix-blend-lighten pointer-events-none"
            onError={(e) => {
              // fallback to generic style if not found
              (e.target as HTMLElement).style.display = 'none';

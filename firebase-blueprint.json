@@ -1,0 +1,21 @@
+{
+  "entities": {
+    "Memory": {
+      "title": "Memory",
+      "description": "A stored fact or memory about a user.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The UID of the user this memory belongs to." },
+        "fact": { "type": "string", "description": "The memory text." },
+        "createdAt": { "type": "number", "description": "Timestamp." }
+      },
+      "required": ["userId", "fact"]
+    }
+  },
+  "firestore": {
+    "users/{userId}/memories/{memoryId}": {
+      "schema": "Memory",
+      "description": "Memories of the user."
+    }
+  }
+}

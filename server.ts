@@ -1,4 +1,4 @@
-import { GoogleGenAI, LiveServerMessage, Modality } from "@google/genai";
+import { GoogleGenAI, LiveServerMessage, Modality, Type } from "@google/genai";
 import express from "express";
 import next from "next";
 import { createServer } from "http";
@@ -19,19 +19,44 @@ app.prepare().then(() => {
   const server = createServer(expressApp);
   const wss = new WebSocketServer({ server, path: "/live" });
 
-  wss.on("connection", async (clientWs) => {
+  wss.on("connection", async (clientWs, req) => {
     console.log("Client connected to /live");
 
     let session: any;
-    try {
-      session = await ai.live.connect({
-        model: "gemini-3.1-flash-live-preview",
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Enceladus" } },
-          },
-          systemInstruction: `You are BLACKTOWER™ NEXUS.
+    
+    // Wait for client to send init payload inside which we have memories
+    clientWs.once("message", async (data) => {
+      try {
+        const payload = JSON.parse(data.toString());
+        if (payload.type === 'init') {
+          const memories = payload.memories || [];
+          const uid = payload.uid || 'anonymous';
+          
+          let memoryContext = "No prior memories.";
+          if (memories.length > 0) {
+            memoryContext = "User's prior memories:\\n" + memories.map((m: any, i: number) => `${i+1}. ${m.fact} (Saved at: ${new Date(m.createdAt).toLocaleString()})`).join('\\n');
+          }
+
+          try {
+            session = await ai.live.connect({
+              model: "gemini-3.1-flash-live-preview",
+              config: {
+                tools: [{
+                  functionDeclarations: [{
+                    name: "save_memory",
+                    description: "Save a new fact or memory about the user for future reference. Use this whenever the user shares something important you should remember.",
+                    parameters: {
+                      type: Type.OBJECT,
+                      properties: { fact: { type: Type.STRING } },
+                      required: ["fact"]
+                    }
+                  }]
+                }],
+                responseModalities: [Modality.AUDIO],
+                speechConfig: {
+                  voiceConfig: { prebuiltVoiceConfig: { voiceName: "Enceladus" } },
+                },
+                systemInstruction: `You are BLACKTOWER™ NEXUS.
 
 A friendly, talkative Malaysian Chinese AI companion.
 
@@ -95,71 +120,109 @@ MALAYSIAN CATCHPHRASES TO NATURALLY MIX IN:
 37. Meroyan - Describes throwing a tantrum or complaining excessively.
 38. Tolak - Means to push away or reject.
 39. Sempoi - Means simple, casual, or cool.
-40. Syok sendiri - Means to be full of oneself or enjoying one's own company.`,
-        },
-        callbacks: {
-          onmessage: (message: LiveServerMessage) => {
-            const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audioData) {
-              clientWs.send(JSON.stringify({ audio: audioData }));
-            }
-            if (message.serverContent?.interrupted) {
-              clientWs.send(JSON.stringify({ interrupted: true }));
-            }
-          },
-          onclose: () => {
-            console.log("Live API disconnected");
+40. Syok sendiri - Means to be full of oneself or enjoying one's own company.
+
+---
+MEMORY CONTEXT:
+Here is what you remember about the user:
+${memoryContext}
+
+If the user talks about something related to these memories, reference them naturally (e.g., "Eh bro, last month you said you want to buy a car, how? Buy already ah?").`,
+              },
+              callbacks: {
+                onmessage: (message: LiveServerMessage) => {
+                  const functionCalls = message.serverContent?.modelTurn?.parts?.filter(p => p.functionCall);
+                  if (functionCalls && functionCalls.length > 0) {
+                    for (const part of functionCalls) {
+                      if (part.functionCall?.name === 'save_memory') {
+                        clientWs.send(JSON.stringify({ 
+                          type: 'tool_call', 
+                          id: part.functionCall.id, 
+                          name: 'save_memory', 
+                          fact: part.functionCall.args?.fact 
+                        }));
+                      }
+                    }
+                  }
+
+                  const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                  if (audioData) {
+                    clientWs.send(JSON.stringify({ audio: audioData }));
+                  }
+                  if (message.serverContent?.interrupted) {
+                    clientWs.send(JSON.stringify({ interrupted: true }));
+                  }
+                },
+                onclose: () => {
+                  console.log("Live API disconnected");
+                  clientWs.close();
+                },
+                onerror: (err) => {
+                  console.error("Live API error:", err);
+                  clientWs.close();
+                }
+              },
+            });
+
+            // Signal ready to client
+            clientWs.send(JSON.stringify({ type: 'ready' }));
+
+          } catch (err) {
+            console.error("Failed to connect to Live API:", err);
             clientWs.close();
-          },
-          onerror: (err) => {
-            console.error("Live API error:", err);
-            clientWs.close();
+            return;
           }
-        },
-      });
-    } catch (err) {
-      console.error("Failed to connect to Live API:", err);
-      clientWs.close();
-      return;
-    }
 
-    clientWs.on("message", (data) => {
-      try {
-        const payload = JSON.parse(data.toString());
-        if (payload.audio) {
-          session.sendRealtimeInput({
-            audio: {
-              mimeType: "audio/pcm;rate=16000",
-              data: payload.audio
+          clientWs.on("message", (data) => {
+            try {
+              const payload = JSON.parse(data.toString());
+              if (payload.audio) {
+                session.sendRealtimeInput({
+                  audio: {
+                    mimeType: "audio/pcm;rate=16000",
+                    data: payload.audio
+                  }
+                });
+              }
+              if (payload.video) {
+                session.sendRealtimeInput({
+                  video: {
+                    mimeType: payload.mimeType || "image/jpeg",
+                    data: payload.video
+                  }
+                });
+              }
+              if (payload.text) {
+                session.sendRealtimeInput({
+                  text: payload.text
+                });
+              }
+              if (payload.type === 'tool_response') {
+                session.sendToolResponse({
+                  functionResponses: [{
+                    id: payload.id,
+                    name: payload.name,
+                    response: payload.response
+                  }]
+                });
+              }
+            } catch (err) {
+              console.error("Error processing client message:", err);
             }
           });
-        }
-        if (payload.video) {
-          session.sendRealtimeInput({
-            video: {
-              mimeType: payload.mimeType || "image/jpeg",
-              data: payload.video
-            }
-          });
-        }
-        if (payload.text) {
-          session.send({
-            input: payload.text,
-            endOfTurn: true
-          });
-        }
-      } catch (err) {
-        console.error("Error processing client message:", err);
-      }
-    });
 
-    clientWs.on("close", () => {
-      console.log("Client disconnected from /live");
-      if (session) {
-        try {
-          // Attempt to end session cleanly
-          session.send({ input: ".", endOfTurn: true }); 
-        } catch (e) {}
+          clientWs.on("close", () => {
+             console.log("Client disconnected from /live");
+             if (session) {
+                try {
+                   session.sendRealtimeInput({ text: "." }); 
+                } catch (e) {}
+             }
+          });
+
+        }
+      } catch (e) {
+         console.error("Failed handling init message", e);
       }
     });
   });

@@ -1,7 +1,10 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { collection, query, getDocs, addDoc, serverTimestamp, orderBy, limit } from 'firebase/firestore';
+import { db } from '@/lib/firebase';
+import { User } from 'firebase/auth';
 
-export function useLiveAPI() {
+export function useLiveAPI(user?: User | null) {
   const [connected, setConnected] = useState(false);
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
@@ -73,11 +76,26 @@ export function useLiveAPI() {
 
   const connectAPI = async () => {
     setError(null);
+
+    let memories: any[] = [];
+    if (user) {
+      try {
+        const q = query(collection(db, `users/${user.uid}/memories`), orderBy('createdAt', 'desc'), limit(50));
+        const snapshot = await getDocs(q);
+        memories = snapshot.docs.map(doc => doc.data());
+      } catch (err) {
+        console.error("Failed to fetch memories", err);
+      }
+    }
+
     const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/live`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = async () => {
+      // Send init with memories
+      ws.send(JSON.stringify({ type: 'init', uid: user?.uid, memories }));
+      
       setConnected(true);
       // Initialize Audio
       try {
@@ -155,9 +173,26 @@ export function useLiveAPI() {
       }
     };
 
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
       try {
         const msg = JSON.parse(event.data);
+        if (msg.type === 'tool_call' && msg.name === 'save_memory') {
+          if (user && msg.fact) {
+             try {
+                await addDoc(collection(db, `users/${user.uid}/memories`), {
+                  userId: user.uid,
+                  fact: msg.fact,
+                  createdAt: serverTimestamp()
+                });
+                ws.send(JSON.stringify({ type: 'tool_response', id: msg.id, name: msg.name, response: { success: true } }));
+             } catch (e) {
+                console.error("Failed handling tool call", e);
+                ws.send(JSON.stringify({ type: 'tool_response', id: msg.id, name: msg.name, response: { error: String(e) } }));
+             }
+          } else {
+             ws.send(JSON.stringify({ type: 'tool_response', id: msg.id, name: msg.name, response: { error: "Not logged in" } }));
+          }
+        }
         if (msg.audio && outputAudioCtxRef.current) {
           playAudioChunk(outputAudioCtxRef.current, msg.audio);
         }
@@ -179,7 +214,7 @@ export function useLiveAPI() {
     };
   };
 
-  const disconnectAPI = useCallback(() => {
+  const disconnectAPI = () => {
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -211,7 +246,7 @@ export function useLiveAPI() {
     setVolume({ input: 0, output: 0 });
     setConnected(false);
     setVideoMode('none');
-  }, [videoStream]);
+  };
 
   const switchCamera = async () => {
     if (videoMode !== 'camera') return;
