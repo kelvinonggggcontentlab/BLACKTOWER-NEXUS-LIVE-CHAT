@@ -1,0 +1,6 @@
+{
+  "name": "Live Multimodal Video & Audio",
+  "description": "A real-time multimodal interface for the Gemini Live API. Connect to stream camera, screen, and microphone.",
+  "requestFramePermissions": ["camera", "microphone", "display-capture"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,306 @@
+'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+
+export function useLiveAPI() {
+  const [connected, setConnected] = useState(false);
+  const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
+  const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
+  const [videoMode, setVideoMode] = useState<'camera' | 'screen' | 'none'>('none');
+  
+  const [volume, setVolume] = useState<{ input: number, output: number }>({ input: 0, output: 0 });
+  const [isThinking, setIsThinking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
+
+  const wsRef = useRef<WebSocket | null>(null);
+  const inputAudioCtxRef = useRef<AudioContext | null>(null);
+  const outputAudioCtxRef = useRef<AudioContext | null>(null);
+  const inputAnalyserRef = useRef<AnalyserNode | null>(null);
+  const outputAnalyserRef = useRef<AnalyserNode | null>(null);
+  const volumeIntervalRef = useRef<any>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const sendFramesIntervalRef = useRef<any>(null);
+  const videoElementRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const nextStartTimeRef = useRef<number>(0);
+
+  const bufferToPCM = (buffer: Float32Array) => {
+    let l = buffer.length;
+    const buf = new Int16Array(l);
+    while (l--) {
+      // @ts-ignore
+      buf[l] = Math.min(1, buffer[l]) * 0x7fff;
+    }
+    return Buffer.from(buf.buffer).toString('base64');
+  };
+
+  const playAudioChunk = (audioCtx: AudioContext, base64Audio: string) => {
+    const binaryStr = atob(base64Audio);
+    const len = binaryStr.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+    
+    // The Live API outputs 24kHz 16-bit little-endian PCM
+    const view = new DataView(bytes.buffer);
+    const floats = new Float32Array(bytes.length / 2);
+    for (let i = 0; i < floats.length; i++) {
+        floats[i] = view.getInt16(i * 2, true) / 32768; // true for little endpoint
+    }
+    
+    const buffer = audioCtx.createBuffer(1, floats.length, 24000);
+    buffer.getChannelData(0).set(floats);
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    if (outputAnalyserRef.current) {
+        source.connect(outputAnalyserRef.current);
+        outputAnalyserRef.current.connect(audioCtx.destination);
+    } else {
+        source.connect(audioCtx.destination);
+    }
+    
+    const currentTime = audioCtx.currentTime;
+    if (nextStartTimeRef.current < currentTime) {
+      nextStartTimeRef.current = currentTime;
+    }
+    
+    source.start(nextStartTimeRef.current);
+    nextStartTimeRef.current += buffer.duration;
+  };
+
+  const connectAPI = async () => {
+    setError(null);
+    const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/live`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = async () => {
+      setConnected(true);
+      // Initialize Audio
+      try {
+        const _inputAudioCtx = new AudioContext({ sampleRate: 16000 });
+        inputAudioCtxRef.current = _inputAudioCtx;
+        
+        const _outputAudioCtx = new AudioContext({ sampleRate: 24000 });
+        outputAudioCtxRef.current = _outputAudioCtx;
+
+        // Analysers
+        const inAnalyser = _inputAudioCtx.createAnalyser();
+        inAnalyser.fftSize = 512;
+        inputAnalyserRef.current = inAnalyser;
+
+        const outAnalyser = _outputAudioCtx.createAnalyser();
+        outAnalyser.fftSize = 512;
+        outputAnalyserRef.current = outAnalyser;
+
+        // Start volume monitoring
+        volumeIntervalRef.current = setInterval(() => {
+          let inVol = 0;
+          let outVol = 0;
+          if (inputAnalyserRef.current) {
+            const data = new Uint8Array(inputAnalyserRef.current.frequencyBinCount);
+            inputAnalyserRef.current.getByteFrequencyData(data);
+            const sum = data.reduce((a, b) => a + b, 0);
+            inVol = sum / data.length;
+          }
+          if (outputAnalyserRef.current) {
+            const data = new Uint8Array(outputAnalyserRef.current.frequencyBinCount);
+            outputAnalyserRef.current.getByteFrequencyData(data);
+            const sum = data.reduce((a, b) => a + b, 0);
+            outVol = sum / data.length;
+          }
+          setVolume({ input: inVol, output: outVol });
+        }, 50);
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(err => {
+          throw new Error('Audio device not found or Permission denied: ' + err.message);
+        });
+        streamRef.current = stream;
+        
+        const source = _inputAudioCtx.createMediaStreamSource(stream);
+        const processor = _inputAudioCtx.createScriptProcessor(4096, 1, 1);
+        source.connect(inAnalyser);
+        source.connect(processor);
+        processor.connect(_inputAudioCtx.destination);
+
+        processor.onaudioprocess = (e) => {
+          if (ws.readyState !== WebSocket.OPEN) return;
+          const float32Array = e.inputBuffer.getChannelData(0);
+          
+          // Helper instead of Buffer in browser:
+          let pcm16 = new Int16Array(float32Array.length);
+          for (let i = 0; i < float32Array.length; i++) {
+            let s = Math.max(-1, Math.min(1, float32Array[i]));
+            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+          }
+          
+          // btoa array buffer
+          let binary = '';
+          const bytes = new Uint8Array(pcm16.buffer);
+          for (let i = 0; i < bytes.byteLength; i++) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          const base64 = window.btoa(binary);
+          
+          ws.send(JSON.stringify({ audio: base64 }));
+        };
+      } catch (err: any) {
+        console.error('Audio setup failed:', err);
+        setError(err.message || 'Audio setup failed');
+        setConnected(false);
+        ws.close();
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.audio && outputAudioCtxRef.current) {
+          playAudioChunk(outputAudioCtxRef.current, msg.audio);
+        }
+        if (msg.interrupted) {
+          if (outputAudioCtxRef.current) {
+             outputAudioCtxRef.current.close().then(() => {
+                 const newCtx = new AudioContext({ sampleRate: 24000 });
+                 outputAudioCtxRef.current = newCtx;
+                 nextStartTimeRef.current = newCtx.currentTime;
+             });
+          }
+        }
+      } catch (err) { }
+    };
+
+    ws.onclose = () => {
+      setConnected(false);
+      disconnectAPI();
+    };
+  };
+
+  const disconnectAPI = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    if (inputAudioCtxRef.current) {
+      inputAudioCtxRef.current.close();
+      inputAudioCtxRef.current = null;
+    }
+    if (outputAudioCtxRef.current) {
+      outputAudioCtxRef.current.close();
+      outputAudioCtxRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    if (videoStream) {
+      videoStream.getTracks().forEach((track) => track.stop());
+      setVideoStream(null);
+    }
+    if (sendFramesIntervalRef.current) {
+      clearInterval(sendFramesIntervalRef.current);
+      sendFramesIntervalRef.current = null;
+    }
+    if (volumeIntervalRef.current) {
+      clearInterval(volumeIntervalRef.current);
+      volumeIntervalRef.current = null;
+    }
+    setVolume({ input: 0, output: 0 });
+    setConnected(false);
+    setVideoMode('none');
+  }, [videoStream]);
+
+  const switchCamera = async () => {
+    if (videoMode !== 'camera') return;
+    const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(nextMode);
+    
+    // Stop current track
+    if (videoStream) {
+       videoStream.getTracks().forEach(t => t.stop());
+    }
+    
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: 1280, height: 720, facingMode: nextMode } 
+      });
+      setVideoStream(stream);
+      if (videoElementRef.current) {
+        videoElementRef.current.srcObject = stream;
+      }
+    } catch(e) {
+      console.error(e)
+    }
+  };
+
+  const toggleVideo = async (mode: 'camera' | 'screen') => {
+    if (videoStream) {
+       videoStream.getTracks().forEach(t => t.stop());
+       setVideoStream(null);
+       if (videoMode === mode) {
+           setVideoMode('none');
+           if (sendFramesIntervalRef.current) clearInterval(sendFramesIntervalRef.current);
+           return;
+       }
+    }
+    
+    try {
+      let stream: MediaStream;
+      if (mode === 'camera') {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode } });
+      } else {
+        stream = await navigator.mediaDevices.getDisplayMedia({ video: { width: 1280, height: 720 } });
+      }
+      setVideoStream(stream);
+      setVideoMode(mode);
+
+      if (videoElementRef.current) {
+        videoElementRef.current.srcObject = stream;
+      }
+      
+      if (sendFramesIntervalRef.current) {
+         clearInterval(sendFramesIntervalRef.current);
+      }
+      
+      // Sending frame every ~1s (1 fps limit)
+      sendFramesIntervalRef.current = setInterval(() => {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+        const video = videoElementRef.current;
+        const canvas = canvasRef.current;
+        if (video && canvas && video.videoWidth > 0 && video.videoHeight > 0) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+               ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+               const base64DataUrl = canvas.toDataURL('image/jpeg', 0.8);
+               const base64Str = base64DataUrl.split(',')[1];
+               wsRef.current.send(JSON.stringify({ video: base64Str, mimeType: 'image/jpeg' }));
+            }
+        }
+      }, 1000);
+      
+    } catch (e) {
+      console.error("Video error:", e);
+      setVideoMode('none');
+    }
+  };
+
+  return {
+    connected,
+    volume,
+    error,
+    videoMode,
+    facingMode,
+    videoElementRef,
+    canvasRef,
+    videoStream,
+    connectAPI,
+    disconnectAPI,
+    toggleVideo,
+    switchCamera
+  };
+}
