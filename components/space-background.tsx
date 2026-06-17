@@ -8,36 +8,29 @@ export function SpaceBackground() {
   const [isReady, setIsReady] = useState(false);
   const [isDay, setIsDay] = useState(false);
   
-  const [stars, setStars] = useState<{ id: number; w: string; h: string; top: string; left: string; dur: number; delay: number }[]>([]);
-  const [particles, setParticles] = useState<{ id: number; w: string; h: string; top: string; left: string; x: number; y: number; dur: number }[]>([]);
+  const [stars, setStars] = useState(() => Array.from({ length: 50 }).map((_, i) => ({
+    id: i,
+    w: Math.random() * 2 + 1 + 'px',
+    h: Math.random() * 2 + 1 + 'px',
+    top: Math.random() * 100 + '%',
+    left: Math.random() * 100 + '%',
+    dur: Math.random() * 3 + 4,
+    delay: Math.random() * 5,
+  })));
+  const [particles, setParticles] = useState(() => Array.from({ length: 15 }).map((_, i) => ({
+    id: i,
+    w: Math.random() * 200 + 50 + 'px',
+    h: Math.random() * 200 + 50 + 'px',
+    top: Math.random() * 100 + '%',
+    left: Math.random() * 100 + '%',
+    x: Math.random() * 100 - 50,
+    y: Math.random() * 100 - 50,
+    dur: Math.random() * 20 + 20,
+  })));
 
   useEffect(() => {
     // Generate stars and particles on mount
-    const newStars = Array.from({ length: 50 }).map((_, i) => ({
-      id: i,
-      w: Math.random() * 2 + 1 + 'px',
-      h: Math.random() * 2 + 1 + 'px',
-      top: Math.random() * 100 + '%',
-      left: Math.random() * 100 + '%',
-      dur: Math.random() * 3 + 4,
-      delay: Math.random() * 5,
-    }));
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setStars(newStars);
-
-    const newParticles = Array.from({ length: 15 }).map((_, i) => ({
-      id: i,
-      w: Math.random() * 200 + 50 + 'px',
-      h: Math.random() * 200 + 50 + 'px',
-      top: Math.random() * 100 + '%',
-      left: Math.random() * 100 + '%',
-      x: Math.random() * 100 - 50,
-      y: Math.random() * 100 - 50,
-      dur: Math.random() * 20 + 20,
-    }));
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setParticles(newParticles);
-
+    
     const updateTime = () => {
       const now = new Date();
       // Format time to Asia/Kuala_Lumpur, get just the hour
@@ -91,7 +84,7 @@ export function SpaceBackground() {
         {particles.map((p) => (
           <motion.div
             key={`particle-${p.id}`}
-            className="absolute bg-white/5 rounded-full blur-xl"
+            className="absolute bg-white/5 rounded-full"
             style={{
               width: p.w,
               height: p.h,

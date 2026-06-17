@@ -6,6 +6,7 @@ import { User } from 'firebase/auth';
 
 export function useLiveAPI(user?: User | null) {
   const [connected, setConnected] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [audioStream, setAudioStream] = useState<MediaStream | null>(null);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
   const [videoMode, setVideoMode] = useState<'camera' | 'screen' | 'none'>('none');
@@ -13,6 +14,13 @@ export function useLiveAPI(user?: User | null) {
   const [volume, setVolume] = useState<{ input: number, output: number }>({ input: 0, output: 0 });
   const [isThinking, setIsThinking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [transcript, setTranscript] = useState<{ role: 'user' | 'model'; content: string }[]>([]);
+  const [voice, setVoice] = useState('Enceladus');
+  const [speed, setSpeed] = useState(1);
+  
+  // Context tags to show what NEXUS is using
+  const [contextTags, setContextTags] = useState<{ id: string; type: 'email' | 'doc'; label: string }[]>([]);
 
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
 
@@ -27,6 +35,10 @@ export function useLiveAPI(user?: User | null) {
   const videoElementRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const nextStartTimeRef = useRef<number>(0);
+
+  const isAutoReconnectEnabledRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimeoutRef = useRef<any>(null);
 
   const bufferToPCM = (buffer: Float32Array) => {
     let l = buffer.length;
@@ -74,8 +86,14 @@ export function useLiveAPI(user?: User | null) {
     nextStartTimeRef.current += buffer.duration;
   };
 
-  const connectAPI = async () => {
-    setError(null);
+  const connectAPI = async (isReconnect = false) => {
+    isAutoReconnectEnabledRef.current = true;
+    if (!isReconnect) {
+      reconnectAttemptsRef.current = 0;
+      setError(null);
+    } else {
+      setIsReconnecting(true);
+    }
 
     let memories: any[] = [];
     if (user) {
@@ -93,8 +111,10 @@ export function useLiveAPI(user?: User | null) {
     wsRef.current = ws;
 
     ws.onopen = async () => {
+      reconnectAttemptsRef.current = 0;
+      setIsReconnecting(false);
       // Send init with memories
-      ws.send(JSON.stringify({ type: 'init', uid: user?.uid, memories }));
+      ws.send(JSON.stringify({ type: 'init', uid: user?.uid, memories, voice, speed }));
       
       setConnected(true);
       // Initialize Audio
@@ -133,49 +153,65 @@ export function useLiveAPI(user?: User | null) {
           setVolume({ input: inVol, output: outVol });
         }, 50);
 
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true }).catch(err => {
-          throw new Error('Audio device not found or Permission denied: ' + err.message);
-        });
-        streamRef.current = stream;
-        
-        const source = _inputAudioCtx.createMediaStreamSource(stream);
-        const processor = _inputAudioCtx.createScriptProcessor(4096, 1, 1);
-        source.connect(inAnalyser);
-        source.connect(processor);
-        processor.connect(_inputAudioCtx.destination);
-
-        processor.onaudioprocess = (e) => {
-          if (ws.readyState !== WebSocket.OPEN) return;
-          const float32Array = e.inputBuffer.getChannelData(0);
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          streamRef.current = stream;
           
-          // Helper instead of Buffer in browser:
-          let pcm16 = new Int16Array(float32Array.length);
-          for (let i = 0; i < float32Array.length; i++) {
-            let s = Math.max(-1, Math.min(1, float32Array[i]));
-            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-          }
-          
-          // btoa array buffer
-          let binary = '';
-          const bytes = new Uint8Array(pcm16.buffer);
-          for (let i = 0; i < bytes.byteLength; i++) {
-            binary += String.fromCharCode(bytes[i]);
-          }
-          const base64 = window.btoa(binary);
-          
-          ws.send(JSON.stringify({ audio: base64 }));
-        };
+          const source = _inputAudioCtx.createMediaStreamSource(stream);
+          const processor = _inputAudioCtx.createScriptProcessor(4096, 1, 1);
+          source.connect(inAnalyser);
+          source.connect(processor);
+          processor.connect(_inputAudioCtx.destination);
+  
+          processor.onaudioprocess = (e) => {
+            if (ws.readyState !== WebSocket.OPEN || !micEnabled) return;
+            const float32Array = e.inputBuffer.getChannelData(0);
+            
+            // Helper instead of Buffer in browser:
+            let pcm16 = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+              let s = Math.max(-1, Math.min(1, float32Array[i]));
+              pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            
+            // btoa array buffer
+            let binary = '';
+            const bytes = new Uint8Array(pcm16.buffer);
+            for (let i = 0; i < bytes.byteLength; i++) {
+              binary += String.fromCharCode(bytes[i]);
+            }
+            const base64 = window.btoa(binary);
+            
+            ws.send(JSON.stringify({ audio: base64 }));
+          };
+          setMicEnabled(true);
+          setError(null);
+        } catch (err: any) {
+          console.warn('Microphone access denied or not available, proceeding without input audio:', err);
+          setMicEnabled(false);
+          // Do not set error here to avoid UI crash, just disable mic
+        }
       } catch (err: any) {
         console.error('Audio setup failed:', err);
-        setError(err.message || 'Audio setup failed');
+        setError('Audio setup failed: ' + (err.message || 'Unknown error'));
         setConnected(false);
         ws.close();
       }
     };
 
+    ws.onerror = (err) => {
+      console.error("WebSocket error:", err);
+      setError("WebSocket connection error");
+    };
+
     ws.onmessage = async (event) => {
       try {
         const msg = JSON.parse(event.data);
+
+        if (msg.type === 'text') {
+            setTranscript(prev => [...prev, { role: 'model', content: msg.text }]);
+        }
+
         if (msg.type === 'tool_call' && msg.name === 'save_memory') {
           if (user && msg.fact) {
              try {
@@ -210,11 +246,38 @@ export function useLiveAPI(user?: User | null) {
 
     ws.onclose = () => {
       setConnected(false);
-      disconnectAPI();
+      if (isAutoReconnectEnabledRef.current) {
+        setIsReconnecting(true);
+        if (wsRef.current === ws) wsRef.current = null;
+        if (inputAudioCtxRef.current) { inputAudioCtxRef.current.close(); inputAudioCtxRef.current = null; }
+        if (outputAudioCtxRef.current) { outputAudioCtxRef.current.close(); outputAudioCtxRef.current = null; }
+        if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+        if (volumeIntervalRef.current) clearInterval(volumeIntervalRef.current);
+        
+        const delay = Math.min(10000, 1000 * (reconnectAttemptsRef.current + 1));
+        reconnectAttemptsRef.current++;
+        console.log(`Connection lost. Reconnecting in ${delay}ms (Attempt ${reconnectAttemptsRef.current})...`);
+        
+        if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = setTimeout(() => {
+           if (isAutoReconnectEnabledRef.current) {
+              connectAPI(true);
+           }
+        }, delay);
+      } else {
+        setIsReconnecting(false);
+        disconnectAPI();
+      }
     };
   };
 
   const disconnectAPI = () => {
+    isAutoReconnectEnabledRef.current = false;
+    setIsReconnecting(false);
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
     if (wsRef.current) {
       wsRef.current.close();
       wsRef.current = null;
@@ -326,8 +389,16 @@ export function useLiveAPI(user?: User | null) {
 
   return {
     connected,
+    isReconnecting,
     volume,
     error,
+    micEnabled,
+    transcript,
+    voice,
+    speed,
+    setVoice,
+    setSpeed,
+    contextTags, // Expose contextTags
     videoMode,
     facingMode,
     videoElementRef,

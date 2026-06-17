@@ -31,6 +31,8 @@ app.prepare().then(() => {
         if (payload.type === 'init') {
           const memories = payload.memories || [];
           const uid = payload.uid || 'anonymous';
+          const voice = payload.voice || 'Enceladus';
+          const speed = payload.speed || 1;
           
           let memoryContext = "No prior memories.";
           if (memories.length > 0) {
@@ -38,6 +40,7 @@ app.prepare().then(() => {
           }
 
           try {
+            console.log("Attempting to connect to Live API with model: gemini-3.1-flash-live-preview");
             session = await ai.live.connect({
               model: "gemini-3.1-flash-live-preview",
               config: {
@@ -54,7 +57,7 @@ app.prepare().then(() => {
                 }],
                 responseModalities: [Modality.AUDIO],
                 speechConfig: {
-                  voiceConfig: { prebuiltVoiceConfig: { voiceName: "Enceladus" } },
+                  voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } },
                 },
                 systemInstruction: `You are BLACKTOWER™ NEXUS.
 
@@ -145,10 +148,16 @@ If the user talks about something related to these memories, reference them natu
                     }
                   }
 
-                  const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                  const audioData = message.serverContent?.modelTurn?.parts?.find(p => p.inlineData)?.inlineData?.data;
                   if (audioData) {
-                    clientWs.send(JSON.stringify({ audio: audioData }));
+                    clientWs.send(JSON.stringify({ audio: audioData, type: 'audio' }));
                   }
+                  
+                  const textData = message.serverContent?.modelTurn?.parts?.find(p => p.text)?.text;
+                  if (textData) {
+                    clientWs.send(JSON.stringify({ text: textData, type: 'text', role: 'model' }));
+                  }
+
                   if (message.serverContent?.interrupted) {
                     clientWs.send(JSON.stringify({ interrupted: true }));
                   }
