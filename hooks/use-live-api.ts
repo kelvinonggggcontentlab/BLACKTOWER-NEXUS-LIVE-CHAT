@@ -95,24 +95,31 @@ export function useLiveAPI(user?: User | null) {
       setIsReconnecting(true);
     }
 
-    let memories: any[] = [];
-    if (user) {
+    const protocol = typeof window !== 'undefined' ? window.location.protocol : 'https:';
+    const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
+    const wsUrl = `${protocol === 'https:' ? 'wss:' : 'ws:'}//${host}/live`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    // Start fetching memories asynchronously immediately
+    const memoryPromise = (async () => {
+      if (!user) return [];
       try {
         const q = query(collection(db, `users/${user.uid}/memories`), orderBy('createdAt', 'desc'), limit(50));
         const snapshot = await getDocs(q);
-        memories = snapshot.docs.map(doc => doc.data());
+        return snapshot.docs.map(doc => doc.data());
       } catch (err) {
         console.error("Failed to fetch memories", err);
+        return [];
       }
-    }
-
-    const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/live`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    })();
 
     ws.onopen = async () => {
       reconnectAttemptsRef.current = 0;
       setIsReconnecting(false);
+
+      const memories = await memoryPromise;
+
       // Send init with memories
       ws.send(JSON.stringify({ type: 'init', uid: user?.uid, memories, voice, speed }));
       
